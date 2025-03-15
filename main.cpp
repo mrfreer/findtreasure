@@ -9,8 +9,14 @@
 const int screenWidth = 1280;
 const int screenHeight = 720;
 const float playerSpeed = 5.0f;
-const float gravity = 0.5f;
-const float jumpForce = -12.0f;
+const float gravity = 0.4f;                // Reduced gravity for smoother falling
+const float jumpForce = -10.0f;            // Reduced initial jump force
+const float jumpHoldForce = -0.5f;         // Additional force when holding jump button
+const float maxJumpHoldTime = 15.0f;       // Maximum frames to apply additional jump force
+const float airControlFactor = 0.7f;       // Reduced control in air (0.0 to 1.0)
+const float terminalVelocity = 12.0f;      // Maximum falling speed
+const int coyoteTimeFrames = 6;            // Frames where player can still jump after leaving platform
+const int jumpBufferFrames = 6;            // Frames where jump input is remembered before landing
 const int tileSize = 64;  // Size of each tile in pixels
 const float batScale = 0.1875f; // Bat scale factor
 const float batSpeed = 2.0f; // Bat movement speed
@@ -26,6 +32,10 @@ struct Player {
     bool isFacingRight;  // To track player direction for sprite flipping
     Texture2D texture;
     int invulnerabilityTimer; // Timer for invulnerability after collision
+    int coyoteTimer;          // Timer for coyote time
+    int jumpBufferTimer;      // Timer for jump buffer
+    int jumpHoldTimer;        // Timer for variable jump height
+    bool isJumpHeld;          // Whether jump button is being held
 };
 
 // Platform/ground structure
@@ -80,6 +90,16 @@ struct Score {
 // Function to calculate distance between two points
 float CalculateDistance(Vector2 p1, Vector2 p2) {
     return sqrtf(powf(p2.x - p1.x, 2) + powf(p2.y - p1.y, 2)); // Using sqrtf and powf for float precision
+}
+
+// Function to blend two colors with a bias towards the base color
+Color BlendColors(Color base, Color tint, float factor = 0.3f) {
+    Color result;
+    result.r = static_cast<unsigned char>(base.r * (1.0f - factor) + tint.r * factor);
+    result.g = static_cast<unsigned char>(base.g * (1.0f - factor) + tint.g * factor);
+    result.b = static_cast<unsigned char>(base.b * (1.0f - factor) + tint.b * factor);
+    result.a = base.a;
+    return result;
 }
 
 // Function to respawn bat at a random position away from player
@@ -303,7 +323,11 @@ int main() {
         {100, screenHeight - tileSize - playerTexture.height * batScale, playerTexture.width * batScale, playerTexture.height * batScale},  // bounds updated to match bat scale
         true,                       // isFacingRight
         playerTexture,              // texture
-        0                           // invulnerabilityTimer
+        0,                          // invulnerabilityTimer
+        0,                          // coyoteTimer
+        0,                          // jumpBufferTimer
+        0,                          // jumpHoldTimer
+        false                       // isJumpHeld
     };
     
     // Initialize bat enemy
@@ -394,24 +418,58 @@ int main() {
         // Update
         if (!gameOver) {
             // Handle player movement
+            float moveSpeed = player.speed;
+            if (player.isJumping) {
+                // Reduce control in the air
+                moveSpeed *= airControlFactor;
+            }
+            
             if (IsKeyDown(KEY_RIGHT)) {
-                player.position.x += player.speed;
+                player.position.x += moveSpeed;
                 player.isFacingRight = true;
             }
             if (IsKeyDown(KEY_LEFT)) {
-                player.position.x -= player.speed;
+                player.position.x -= moveSpeed;
                 player.isFacingRight = false;
             }
             
-            // Handle jumping
-            if ((IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_UP)) && !player.isJumping) {
+            // Handle jump buffer (remember jump input for a few frames)
+            if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_UP)) {
+                player.jumpBufferTimer = jumpBufferFrames;
+            }
+            
+            // Track if jump button is held down
+            player.isJumpHeld = IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_UP);
+            
+            // Handle jumping with coyote time and jump buffer
+            if ((player.jumpBufferTimer > 0) && (player.coyoteTimer > 0 || !player.isJumping)) {
                 player.velocity.y = jumpForce;
                 player.isJumping = true;
+                player.jumpHoldTimer = maxJumpHoldTime;
+                player.jumpBufferTimer = 0;
+                player.coyoteTimer = 0;
+            }
+            
+            // Variable jump height based on how long jump is held
+            if (player.isJumpHeld && player.jumpHoldTimer > 0 && player.velocity.y < 0) {
+                player.velocity.y += jumpHoldForce;
+                player.jumpHoldTimer--;
+            } else {
+                player.jumpHoldTimer = 0;
             }
 
-            // Apply gravity
+            // Apply gravity with terminal velocity
             player.velocity.y += gravity;
+            if (player.velocity.y > terminalVelocity) {
+                player.velocity.y = terminalVelocity;
+            }
+            
+            // Update position based on velocity
             player.position.y += player.velocity.y;
+            
+            // Decrement timers
+            if (player.jumpBufferTimer > 0) player.jumpBufferTimer--;
+            if (player.coyoteTimer > 0) player.coyoteTimer--;
             
             // Check if player has fallen off the sides of the screen
             if (player.position.x < -player.bounds.width * 2 || 
@@ -445,6 +503,7 @@ int main() {
                              player.position.y - player.velocity.y >= platform.rect.y + platform.rect.height - 5) {
                         player.position.y = platform.rect.y + platform.rect.height;
                         player.velocity.y = 0;
+                        player.jumpHoldTimer = 0; // Stop variable jump when hitting ceiling
                     }
                     // Check if hitting platform from the sides
                     else if (player.position.x + player.bounds.width > platform.rect.x && 
@@ -463,7 +522,17 @@ int main() {
                 }
             }
             
-            player.isJumping = !onGround;
+            // Update jumping state and coyote time
+            if (onGround) {
+                player.isJumping = false;
+                player.coyoteTimer = coyoteTimeFrames;
+            } else if (!player.isJumping) {
+                // Start coyote time when player leaves a platform without jumping
+                player.isJumping = true;
+                if (player.coyoteTimer <= 0) {
+                    player.coyoteTimer = coyoteTimeFrames;
+                }
+            }
 
             // Update player bounds
             player.bounds.x = player.position.x;
@@ -572,13 +641,25 @@ int main() {
         if (player.invulnerabilityTimer > 0 && (player.invulnerabilityTimer / 5) % 2 == 0) {
             // Skip drawing player every few frames to create flashing effect
         } else {
+            Color playerColor = WHITE;
+            float baseScale = batScale;
+            
+            // Visual feedback for jumping/falling states
+            if (player.isJumping) {
+                if (player.velocity.y < 0) {
+                    // Rising - slight blue tint
+                    playerColor = BlendColors(WHITE, SKYBLUE);
+                } else if (player.velocity.y > 2.0f) {
+                    // Falling fast - slight yellow tint
+                    playerColor = BlendColors(WHITE, YELLOW);
+                }
+            }
+            
+            // Draw player with appropriate direction
             if (player.isFacingRight) {
-                // Draw player with the same scale as the bat
-                DrawTextureEx(player.texture, player.position, 0.0f, batScale, WHITE);
+                DrawTextureEx(player.texture, player.position, 0.0f, baseScale, playerColor);
             } else {
-                // Draw flipped texture when facing left with the same scale as the bat
-                // Use negative scale for horizontal flipping
-                DrawTextureEx(player.texture, {player.position.x + player.bounds.width, player.position.y}, 0.0f, -batScale, WHITE);
+                DrawTextureEx(player.texture, {player.position.x + player.bounds.width, player.position.y}, 0.0f, -baseScale, playerColor);
             }
         }
         
@@ -604,6 +685,15 @@ int main() {
         char debugInfo[100];
         sprintf(debugInfo, "Player Texture: %dx%d", player.texture.width, player.texture.height);
         DrawText(debugInfo, 20, 50, 20, RED);
+        
+        // Draw jump state debug info
+        char jumpInfo[200];
+        sprintf(jumpInfo, "Jump: %s | Velocity Y: %.1f | Coyote: %d | Buffer: %d", 
+                player.isJumping ? "YES" : "NO", 
+                player.velocity.y,
+                player.coyoteTimer,
+                player.jumpBufferTimer);
+        DrawText(jumpInfo, 20, 80, 20, DARKGREEN);
 
         // Draw score
         char scoreText[100];
